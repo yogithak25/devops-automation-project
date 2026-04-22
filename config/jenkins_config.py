@@ -1,0 +1,610 @@
+import time
+import requests
+import json
+import docker
+import os
+from config.env_loader import get_env
+
+config = get_env()
+BASE_URL = config["JENKINS_URL"]
+CONTAINER_NAME = "jenkins"
+ENV_FILE = "env.txt"
+
+
+# -----------------------------
+# DOCKER CLIENT 
+# -----------------------------
+def get_client():
+    try:
+        return docker.from_env()
+    except:
+        return docker.DockerClient(base_url="npipe://./pipe/docker_engine")
+
+
+client = get_client()
+
+
+# -----------------------------
+# SAFE REQUEST
+# -----------------------------
+def safe_request(method, url, **kwargs):
+    for _ in range(5):
+        try:
+            return requests.request(method, url, timeout=10, **kwargs)
+        except:
+            time.sleep(3)
+    raise Exception(f"❌ API failed: {url}")
+
+
+# -----------------------------
+# UPDATE ENV
+# -----------------------------
+def update_env(key, value):
+    lines = []
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r") as f:
+            lines = f.readlines()
+
+    found = False
+
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            if line.strip() != f"{key}={value}":
+                lines[i] = f"{key}={value}\n"
+            found = True
+
+    if not found:
+        lines.append(f"{key}={value}\n")
+
+    with open(ENV_FILE, "w") as f:
+        f.writelines(lines)
+
+    print(f"✅ {key} updated")
+
+
+# -----------------------------
+# WAIT FOR JENKINS
+# -----------------------------
+def wait_for_jenkins():
+    print("\n⏳ Waiting for Jenkins...\n")
+
+    for i in range(60):
+        try:
+            r = requests.get(f"{BASE_URL}/login")
+            if r.status_code == 200:
+                print("✅ Jenkins Ready")
+                return
+        except:
+            pass
+
+        print(f"Waiting... {i+1}/60")
+        time.sleep(5)
+
+    raise Exception("❌ Jenkins not reachable")
+
+
+# -----------------------------
+# INITIAL PASSWORD
+# -----------------------------
+def get_initial_password():
+    try:
+        container = client.containers.get(CONTAINER_NAME)
+        result = container.exec_run(
+            "cat /var/jenkins_home/secrets/initialAdminPassword"
+        )
+        return result.output.decode().strip()
+    except:
+        return None
+
+
+# -----------------------------
+# LOGIN CHECK
+# -----------------------------
+def can_login(user, pwd):
+    try:
+        r = requests.get(f"{BASE_URL}/api/json", auth=(user, pwd))
+        return r.status_code == 200
+    except:
+        return False
+
+
+# -----------------------------
+# ENSURE PASSWORD
+# -----------------------------
+def ensure_password():
+    print("\n🔐 Ensuring Jenkins password...\n")
+
+    user = config["JENKINS_USER"]
+    new_pwd = config["JENKINS_PASSWORD"]
+
+    if can_login(user, new_pwd):
+        print("✅ Password already set")
+        return
+
+    initial_pwd = get_initial_password()
+
+    session = requests.Session()
+    session.auth = (user, initial_pwd)
+
+    crumb = session.get(f"{BASE_URL}/crumbIssuer/api/json").json()
+    session.headers.update({crumb["crumbRequestField"]: crumb["crumb"]})
+
+    script = f"""
+import jenkins.model.*
+import hudson.security.*
+
+def instance = Jenkins.instance
+
+def realm = new HudsonPrivateSecurityRealm(false)
+realm.createAccount("{user}", "{new_pwd}")
+
+instance.setSecurityRealm(realm)
+
+def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+instance.setAuthorizationStrategy(strategy)
+
+instance.save()
+"""
+
+    session.post(f"{BASE_URL}/scriptText", data={"script": script})
+
+    print("✅ Password set")
+
+    client.containers.get(CONTAINER_NAME).restart()
+    wait_for_jenkins()
+
+
+# -----------------------------
+# GENERATE TOKEN
+# -----------------------------
+def generate_token():
+    print("\n🔑 Generating Jenkins token...\n")
+
+    user = config["JENKINS_USER"]
+    pwd = config["JENKINS_PASSWORD"]
+
+    token = config.get("JENKINS_TOKEN")
+
+    if token and can_login(user, token):
+        print("✅ Token already valid")
+        return token
+
+    session = requests.Session()
+    session.auth = (user, pwd)
+
+    crumb = session.get(f"{BASE_URL}/crumbIssuer/api/json").json()
+    session.headers.update({crumb["crumbRequestField"]: crumb["crumb"]})
+
+    r = session.post(
+        f"{BASE_URL}/user/{user}/descriptorByName/jenkins.security.ApiTokenProperty/generateNewToken",
+        data={"newTokenName": "devops-token"}
+    )
+
+    token = r.json()["data"]["tokenValue"]
+
+    update_env("JENKINS_TOKEN", token)
+
+    print("✅ Token generated")
+
+    return token
+
+
+# -----------------------------
+# INSTALL PLUGINS
+# -----------------------------
+def install_plugins():
+
+    print("\n📦 Installing plugins...\n")
+
+    plugins = [
+        "workflow-aggregator",
+        "git",
+        "github",
+        "pipeline-stage-view",
+        "docker-workflow",
+        "kubernetes",
+        "sonar",
+        "config-file-provider",
+        "maven-plugin",
+        "pipeline-maven"
+    ]
+
+    # -----------------------------
+    # WAIT FOR PLUGIN API READY
+    # -----------------------------
+    print("⏳ Waiting for Plugin Manager API...\n")
+
+    for i in range(30):
+        try:
+            r = requests.get(
+                f"{BASE_URL}/pluginManager/api/json?depth=1",
+                auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+                timeout=5
+            )
+
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                data = r.json()
+                break
+
+        except:
+            pass
+
+        print(f"Waiting plugin API... {i+1}/30")
+        time.sleep(5)
+    else:
+        raise Exception("❌ Plugin API not ready")
+
+    # -----------------------------
+    # GET INSTALLED PLUGINS
+    # -----------------------------
+    installed = [p["shortName"] for p in data.get("plugins", [])]
+
+    # -----------------------------
+    # FILTER MISSING
+    # -----------------------------
+    to_install = [
+        f'<install plugin="{p}@latest"/>' for p in plugins if p not in installed
+    ]
+
+    if not to_install:
+        print("✅ All plugins already installed")
+        return
+
+    print(f"⬇️ Installing {len(to_install)} plugins...")
+
+    xml = f"<jenkins>{''.join(to_install)}</jenkins>"
+
+    # -----------------------------
+    # GET CRUMB
+    # -----------------------------
+    crumb = safe_request(
+        "GET",
+        f"{BASE_URL}/crumbIssuer/api/json",
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    ).json()
+
+    headers = {
+        "Content-Type": "text/xml",
+        crumb["crumbRequestField"]: crumb["crumb"]
+    }
+
+    # -----------------------------
+    # INSTALL PLUGINS
+    # -----------------------------
+    safe_request(
+        "POST",
+        f"{BASE_URL}/pluginManager/installNecessaryPlugins",
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+        headers=headers,
+        data=xml
+    )
+
+    print("⏳ Installing plugins (90s)...")
+    time.sleep(90)
+
+    print("🔄 Restarting Jenkins...")
+
+    client.containers.get(CONTAINER_NAME).restart()
+    wait_for_jenkins()
+
+    print("✅ Plugins installed successfully")
+
+# -----------------------------
+# ADD CREDENTIALS
+# -----------------------------
+def add_credentials():
+    print("\n🔐 Ensuring Jenkins credentials...\n")
+
+    # -----------------------------
+    # GET EXISTING CREDENTIALS
+    # -----------------------------
+    creds_url = f"{BASE_URL}/credentials/store/system/domain/_/api/json?tree=credentials[id]"
+
+    res = safe_request(
+        "GET",
+        creds_url,
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    ).json()
+
+    existing_ids = [c["id"] for c in res.get("credentials", [])]
+
+    # -----------------------------
+    # GET CRUMB
+    # -----------------------------
+    crumb = safe_request(
+        "GET",
+        f"{BASE_URL}/crumbIssuer/api/json",
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    ).json()
+
+    headers = {crumb["crumbRequestField"]: crumb["crumb"]}
+
+    create_url = f"{BASE_URL}/credentials/store/system/domain/_/createCredentials"
+
+    # -----------------------------
+    # CREATE FUNCTION
+    # -----------------------------
+    def ensure_credential(cid, user, pwd):
+        if cid in existing_ids:
+            print(f"✅ {cid} already exists")
+            return
+
+        print(f"➕ Creating {cid}...")
+
+        payload = {
+            "": "0",
+            "credentials": {
+                "scope": "GLOBAL",
+                "id": cid,
+                "username": user,
+                "password": pwd,
+                "description": cid,
+                "$class": "com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl"
+            }
+        }
+
+        safe_request(
+            "POST",
+            create_url,
+            auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+            headers=headers,
+            data={"json": json.dumps(payload)}
+        )
+
+        print(f"✅ {cid} created")
+
+    # -----------------------------
+    # ENSURE ALL CREDENTIALS
+    # -----------------------------
+    ensure_credential("github-cred", config["GITHUB_USER"], config["GITHUB_TOKEN"])
+    ensure_credential("dockerhub-cred", config["DOCKER_USER"], config["DOCKER_PASS"])
+    ensure_credential("nexus-cred", config["NEXUS_USER"], config["NEXUS_PASSWORD"])
+
+    print("\n✅ Credentials setup completed\n")
+
+# -----------------------------
+# SONAR TOKEN CREDENTIAL
+# -----------------------------
+def ensure_sonar_token_credential():
+    url = f"{BASE_URL}/credentials/store/system/domain/_/createCredentials"
+
+    crumb = safe_request(
+        "GET",
+        f"{BASE_URL}/crumbIssuer/api/json",
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    ).json()
+
+    headers = {crumb["crumbRequestField"]: crumb["crumb"]}
+
+    payload = {
+        "": "0",
+        "credentials": {
+            "scope": "GLOBAL",
+            "id": "sonar-token",
+            "secret": config["SONAR_TOKEN"],
+            "$class": "org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl"
+        }
+    }
+
+    safe_request(
+        "POST",
+        url,
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+        headers=headers,
+        data={"json": json.dumps(payload)}
+    )
+
+
+# -----------------------------
+# CONFIGURE TOOLS 
+# -----------------------------
+def configure_tools():
+    print("\n⚙️ Ensuring Maven + Sonar tools...\n")
+
+    script = """
+import jenkins.model.*
+import hudson.tasks.Maven
+import hudson.tasks.Maven.MavenInstaller
+import hudson.tools.InstallSourceProperty
+import hudson.plugins.sonar.*
+
+def jenkins = Jenkins.instance
+
+// -----------------------------
+// MAVEN CONFIG
+// -----------------------------
+def mavenDesc = jenkins.getDescriptorByType(Maven.DescriptorImpl)
+def mavenList = mavenDesc.installations as List
+
+def mavenExists = mavenList.find { it.name == "maven-3" }
+
+if (mavenExists != null) {
+    println("✅ Maven already configured")
+} else {
+    println("🔄 Configuring Maven...")
+
+    def installer = new MavenInstaller("3.9.9")
+    def prop = new InstallSourceProperty([installer])
+    def maven = new Maven.MavenInstallation("maven-3", "", [prop])
+
+    mavenList.add(maven)
+    mavenDesc.setInstallations(mavenList as Maven.MavenInstallation[])
+    mavenDesc.save()
+
+    println("✅ Maven configured")
+}
+
+// -----------------------------
+// SONAR SCANNER CONFIG
+// -----------------------------
+def sonarDesc = jenkins.getDescriptorByType(SonarRunnerInstallation.DescriptorImpl)
+def sonarList = sonarDesc.installations as List
+
+def sonarExists = sonarList.find { it.name == "sonar-scanner" }
+
+if (sonarExists != null) {
+    println("✅ Sonar Scanner already configured")
+} else {
+    println("🔄 Configuring Sonar Scanner...")
+
+    def installer = new SonarRunnerInstaller("latest")
+    def prop = new InstallSourceProperty([installer])
+    def sonar = new SonarRunnerInstallation("sonar-scanner", "", [prop])
+
+    sonarList.add(sonar)
+    sonarDesc.setInstallations(sonarList as SonarRunnerInstallation[])
+    sonarDesc.save()
+
+    println("✅ Sonar Scanner configured")
+}
+
+println("⚙️ Tool configuration ensured")
+"""
+    print(run_groovy(script))
+
+
+
+# -----------------------------
+# CONFIGURE SONAR SERVER
+# -----------------------------
+def configure_sonar():
+
+    print("\n🔗 Configuring SonarQube...\n")
+
+    script = f"""
+import jenkins.model.*
+import hudson.plugins.sonar.*
+import org.jenkinsci.plugins.structs.describable.DescribableModel
+
+def desc = Jenkins.instance.getDescriptorByType(SonarGlobalConfiguration.class)
+
+// -----------------------------
+// CHECK IF CORRECT ALREADY
+// -----------------------------
+def existing = desc.installations.find {{
+    it.name == "sonarqube" &&
+    it.serverUrl == "{config['SONAR_URL']}" &&
+    it.credentialsId == "sonar-token"
+}}
+
+if (existing != null) {{
+    println("SonarQube already configured correctly")
+    return
+}}
+
+// -----------------------------
+// CREATE CORRECT OBJECT
+// -----------------------------
+def model = DescribableModel.of(SonarInstallation)
+
+def instance = model.instantiate([
+    name: "sonarqube",
+    serverUrl: "{config['SONAR_URL']}",
+    credentialsId: "sonar-token"
+])
+
+
+desc.setInstallations([instance] as SonarInstallation[])
+desc.save()
+
+println("SonarQube configured correctly")
+"""
+    print(run_groovy(script))
+
+
+
+# -----------------------------
+# CONFIGURE NEXUS
+# -----------------------------
+def configure_nexus_settings():
+    print("\n📦 Configuring Nexus Maven settings...\n")
+
+    container = client.containers.get(CONTAINER_NAME)
+
+    xml = f"""<settings>
+  <servers>
+    <server>
+      <id>nexus</id>
+      <username>{config["NEXUS_USER"]}</username>
+      <password>{config["NEXUS_PASSWORD"]}</password>
+    </server>
+  </servers>
+</settings>"""
+
+    # -----------------------------
+    # ENSURE DIRECTORY EXISTS
+    # -----------------------------
+    container.exec_run("mkdir -p /var/jenkins_home/.m2")
+
+    # -----------------------------
+    # CHECK IF FILE EXISTS
+    # -----------------------------
+    result = container.exec_run(
+        "cat /var/jenkins_home/.m2/settings.xml",
+        stderr=False
+    )
+
+    if result.exit_code == 0:
+        existing_xml = result.output.decode().strip()
+
+        if existing_xml == xml.strip():
+            print("✅ Nexus Maven settings already configured")
+            return
+        else:
+            print("🔄 Nexus settings found but different → updating...")
+
+    else:
+        print("➕ Creating Nexus Maven settings...")
+
+    # -----------------------------
+    # WRITE FILE (UPDATE OR CREATE)
+    # -----------------------------
+    container.exec_run(
+        f"bash -c 'cat > /var/jenkins_home/.m2/settings.xml <<EOF\n{xml}\nEOF'"
+    )
+
+    print("✅ Nexus Maven settings configured\n")
+
+# -----------------------------
+# RUN GROOVY
+# -----------------------------
+def run_groovy(script):
+    crumb = safe_request(
+        "GET",
+        f"{BASE_URL}/crumbIssuer/api/json",
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    ).json()
+
+    headers = {crumb["crumbRequestField"]: crumb["crumb"]}
+
+    r = safe_request(
+        "POST",
+        f"{BASE_URL}/scriptText",
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+        headers=headers,
+        data={"script": script}
+    )
+
+    return r.text
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def setup_jenkins():
+    print("\n🚀 JENKINS FULL CONFIG STARTED\n")
+
+    wait_for_jenkins()
+    ensure_password()
+    generate_token()
+
+    install_plugins()
+
+    add_credentials()
+    ensure_sonar_token_credential()
+
+    configure_tools()
+    configure_sonar()
+    configure_nexus_settings()
+
+    print("\n✅ JENKINS FULLY CONFIGURED\n")
