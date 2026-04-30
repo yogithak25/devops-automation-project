@@ -45,8 +45,8 @@ def safe_add_crumb(session):
             })
         else:
             print("ℹ️ Crumb not required")
-    except:
-        print("ℹ️ Crumb skipped")
+    except Exception as e:
+        raise Exception(f"❌ Failed to get Jenkins crumb: {e}")
 
 # -----------------------------
 # DOCKER CLIENT 
@@ -220,8 +220,8 @@ instance.save()
 
         session = requests.Session()
         session.auth = (user, initial_pwd)
+        safe_add_crumb(session)
 
-        # ⚠️ no crumb needed for first setup
         script = f"""
 import jenkins.model.*
 import hudson.security.*
