@@ -72,9 +72,6 @@ def main():
 
     print("\n✅ PHASE 4 COMPLETED (ARGOCD READY)\n")
 
-    # =====================================================
-    # 🎉 FINAL
-    # =====================================================
     print("\n🎉 FULL END-TO-END DEVOPS AUTOMATION COMPLETED SUCCESSFULLY!\n")
 
 

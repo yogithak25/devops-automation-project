@@ -15,6 +15,30 @@ client = docker.from_env()
 
 
 # -----------------------------
+# UPDATE ENV
+# -----------------------------
+def write_env(key, value, file_path="env.txt"):
+    lines = []
+    found = False
+
+    with open(file_path, "r") as f:
+        for line in f:
+            if line.startswith(f"{key}="):
+                lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                lines.append(line)
+
+    if not found:
+        lines.append(f"{key}={value}\n")
+
+    with open(file_path, "w") as f:
+        f.writelines(lines)
+
+    print(f"✅ {key} updated in env.txt")
+
+
+# -----------------------------
 # EXEC KUBECTL 
 # -----------------------------
 def kubectl(cmd):
@@ -93,37 +117,105 @@ def login(url, password):
 def ensure_password(url):
     print("\n🔐 Ensuring ArgoCD password...\n")
 
+    user = config["ARGOCD_USER"]
+    current_pwd = config.get("ARGOCD_PASSWORD")
+    new_pwd = config.get("ARGOCD_NEW_PASSWORD")
+
+    # -----------------------------
+    # 1️⃣ TRY CURRENT PASSWORD
+    # -----------------------------
     try:
-        token = login(url, config["ARGOCD_NEW_PASSWORD"])
-        print("✅ Password already configured")
+        token = login(url, current_pwd)
+        print("✅ Logged in with ARGOCD_PASSWORD")
+
+        # update if new password provided
+        if new_pwd and new_pwd != current_pwd:
+            print("🔄 Updating password → ARGOCD_NEW_PASSWORD")
+
+            headers = {"Authorization": f"Bearer {token}"}
+
+            r = safe_request(
+                "PUT",
+                f"{url}/api/v1/account/password",
+                headers=headers,
+                json={
+                    "currentPassword": current_pwd,
+                    "newPassword": new_pwd
+                }
+            )
+
+            if r.status_code not in [200, 204]:
+                raise Exception(f"❌ Password update failed: {r.text}")
+
+            print("✅ Password updated successfully")
+
+            write_env("ARGOCD_PASSWORD", new_pwd)
+            config["ARGOCD_PASSWORD"] = new_pwd
+
+            return login(url, new_pwd)
+
         return token
+
     except:
         pass
 
-    print("🔄 Updating password...")
+    # -----------------------------
+    # 2️⃣ TRY NEW PASSWORD
+    # -----------------------------
+    if new_pwd:
+        try:
+            token = login(url, new_pwd)
+            print("✅ Logged in with ARGOCD_NEW_PASSWORD")
 
-    initial_pwd = get_password()
-    token = login(url, initial_pwd)
+            write_env("ARGOCD_PASSWORD", new_pwd)
+            config["ARGOCD_PASSWORD"] = new_pwd
 
-    headers = {"Authorization": f"Bearer {token}"}
+            return token
+        except:
+            pass
 
-    r = safe_request(
-        "PUT",
-        f"{url}/api/v1/account/password",
-        headers=headers,
-        json={
-            "currentPassword": initial_pwd,
-            "newPassword": config["ARGOCD_NEW_PASSWORD"]
-        }
-    )
+    # -----------------------------
+    # 3️⃣ FIRST RUN (INITIAL PASSWORD)
+    # -----------------------------
+    print("ℹ️ Trying initial password...")
 
-    if r.status_code not in [200, 204]:
-        raise Exception(f"❌ Password update failed: {r.text}")
+    try:
+        initial_pwd = get_password()
+        token = login(url, initial_pwd)
 
-    print("✅ Password updated")
+        target = new_pwd if new_pwd else current_pwd
 
-    return login(url, config["ARGOCD_NEW_PASSWORD"])
+        print("🔄 First-time setup → setting password")
 
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = safe_request(
+            "PUT",
+            f"{url}/api/v1/account/password",
+            headers=headers,
+            json={
+                "currentPassword": initial_pwd,
+                "newPassword": target
+            }
+        )
+
+        if r.status_code not in [200, 204]:
+            raise Exception(f"❌ Initial setup failed: {r.text}")
+
+        print("✅ Password initialized successfully")
+
+        write_env("ARGOCD_PASSWORD", target)
+        config["ARGOCD_PASSWORD"] = target
+
+        return login(url, target)
+
+    except:
+        pass
+
+    # -----------------------------
+    # 4️⃣ FAIL
+    # -----------------------------
+    raise Exception("❌ Unable to determine ArgoCD password state")
 
 # -----------------------------
 # GET APP

@@ -9,6 +9,30 @@ CONTAINER_NAME = "nexus"
 
 
 # -----------------------------
+# ENV UPDATE 
+# -----------------------------
+def update_env(key, value, file_path="env.txt"):
+    lines = []
+    found = False
+
+    with open(file_path, "r") as f:
+        for line in f:
+            if line.startswith(f"{key}="):
+                lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                lines.append(line)
+
+    if not found:
+        lines.append(f"{key}={value}\n")
+
+    with open(file_path, "w") as f:
+        f.writelines(lines)
+
+    print(f"✅ {key} updated in env.txt")
+
+
+# -----------------------------
 # DOCKER CLIENT
 # -----------------------------
 def get_client():
@@ -81,53 +105,111 @@ def get_initial_password():
 
 
 # -----------------------------
-# CHECK PASSWORD
+# ENSURE PASSWORD
 # -----------------------------
-def is_password_changed():
-    try:
+def ensure_password():
+    print("\n🔐 Ensuring Nexus password...\n")
+
+    user = config["NEXUS_USER"]
+    current_password = config.get("NEXUS_PASSWORD")
+    new_password = config.get("NEXUS_NEW_PASSWORD")
+
+    # -----------------------------
+    # 1️⃣ TRY CURRENT PASSWORD
+    # -----------------------------
+    r = safe_request(
+        "GET",
+        f"{BASE_URL}/service/rest/v1/status",
+        auth=(user, current_password)
+    )
+
+    if r.status_code == 200:
+        print("✅ Logged in with NEXUS_PASSWORD")
+
+        if new_password and new_password != current_password:
+            print("🔄 Updating password → NEXUS_NEW_PASSWORD")
+
+            r = safe_request(
+                "PUT",
+                f"{BASE_URL}/service/rest/v1/security/users/admin/change-password",
+                auth=(user, current_password),
+                headers={"Content-Type": "text/plain"},
+                data=new_password
+            )
+
+            if r.status_code in [200, 204]:
+                print("✅ Password updated successfully")
+
+                update_env("NEXUS_PASSWORD", new_password)
+                config["NEXUS_PASSWORD"] = new_password
+
+                return
+            else:
+                raise Exception(f"❌ Password update failed: {r.text}")
+
+        print("✅ No password change required")
+        return
+
+    # -----------------------------
+    # 2️⃣ TRY NEW PASSWORD
+    # -----------------------------
+    if new_password:
         r = safe_request(
             "GET",
             f"{BASE_URL}/service/rest/v1/status",
-            auth=(config["NEXUS_USER"], config["NEXUS_PASSWORD"])
+            auth=(user, new_password)
         )
-        return r.status_code == 200
-    except:
-        return False
+
+        if r.status_code == 200:
+            print("✅ Logged in with NEXUS_NEW_PASSWORD")
+
+            update_env("NEXUS_PASSWORD", new_password)
+            config["NEXUS_PASSWORD"] = new_password
+
+            return
+
+    # -----------------------------
+    # 3️⃣ TRY INITIAL PASSWORD
+    # -----------------------------
+    print("ℹ️ Trying initial password...")
+
+    initial_pwd = get_initial_password()
+
+    if initial_pwd:
+        r = safe_request(
+            "GET",
+            f"{BASE_URL}/service/rest/v1/status",
+            auth=(user, initial_pwd)
+        )
+
+        if r.status_code == 200:
+            target = new_password if new_password else current_password
+
+            print("🔄 First-time setup → setting password")
+
+            r = safe_request(
+                "PUT",
+                f"{BASE_URL}/service/rest/v1/security/users/admin/change-password",
+                auth=(user, initial_pwd),
+                headers={"Content-Type": "text/plain"},
+                data=target
+            )
+
+            if r.status_code in [200, 204]:
+                print("✅ Password initialized successfully")
+
+                update_env("NEXUS_PASSWORD", target)
+                config["NEXUS_PASSWORD"] = target
+
+                return
+
+    raise Exception("❌ Unable to determine Nexus password state")
 
 
 # -----------------------------
-# CHANGE PASSWORD
-# -----------------------------
-def change_password(initial_pwd):
-
-    if is_password_changed():
-        print("✅ Password already updated")
-        return
-
-    if not initial_pwd:
-        raise Exception("❌ Initial password required")
-
-    print("\n🔐 Changing Nexus password...\n")
-
-    r = safe_request(
-        "PUT",
-        f"{BASE_URL}/service/rest/v1/security/users/admin/change-password",
-        auth=("admin", initial_pwd),
-        headers={"Content-Type": "text/plain"},
-        data=config["NEXUS_PASSWORD"]
-    )
-
-    if r.status_code in [200, 204]:
-        print("✅ Password updated")
-    else:
-        raise Exception(f"❌ Password change failed: {r.text}")
-
-
-# -----------------------------
-# CHECK REPO EXISTS
+# REPO EXISTS
 # -----------------------------
 def repo_exists(repo_name):
-
     r = safe_request(
         "GET",
         f"{BASE_URL}/service/rest/v1/repositories",
@@ -139,10 +221,9 @@ def repo_exists(repo_name):
 
 
 # -----------------------------
-# CREATE MAVEN REPO
+# CREATE REPO
 # -----------------------------
 def create_maven_repo():
-
     repo_name = "maven-releases-custom"
 
     if repo_exists(repo_name):
@@ -181,31 +262,15 @@ def create_maven_repo():
 
 
 # -----------------------------
-# GET REPO URL
-# -----------------------------
-def get_repo_url(repo_name):
-
-    repo_url = f"{BASE_URL}/repository/{repo_name}/"
-    print(f"🌐 Repo URL: {repo_url}")
-
-    return repo_url
-
-
-# -----------------------------
-# MAIN FUNCTION
+# MAIN
 # -----------------------------
 def setup_nexus():
-
     print("\n🚀 NEXUS CONFIG STARTED\n")
 
     wait_for_nexus()
-
-    initial_pwd = get_initial_password()
-    change_password(initial_pwd)
+    ensure_password()
 
     repo = create_maven_repo()
-    repo_url = get_repo_url(repo)
 
     print("\n✅ NEXUS CONFIG COMPLETED\n")
-
-    return repo_url
+    return f"{BASE_URL}/repository/{repo}/"

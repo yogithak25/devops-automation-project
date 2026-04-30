@@ -45,7 +45,7 @@ def wait_for_sonar():
 # AUTH
 # -----------------------------
 def get_auth():
-    return (config["SONAR_USER"], config["SONAR_NEW_PASSWORD"])
+    return (config["SONAR_USER"], config["SONAR_PASSWORD"])
 
 
 # -----------------------------
@@ -87,31 +87,115 @@ def update_env(key, value):
 def ensure_password():
     print("\n🔐 Ensuring Sonar password...\n")
 
+    sonar_url = BASE_URL
+    user = config["SONAR_USER"]
+
+    current_password = config.get("SONAR_PASSWORD", "admin")
+    new_password = config.get("SONAR_NEW_PASSWORD")
+
+    # -----------------------------
+    # 1️⃣ TRY CURRENT PASSWORD
+    # -----------------------------
     r = safe_request(
         "GET",
-        f"{BASE_URL}/api/authentication/validate",
-        auth=(config["SONAR_USER"], config["SONAR_NEW_PASSWORD"])
+        f"{sonar_url}/api/authentication/validate",
+        auth=(user, current_password)
     )
 
     if r.status_code == 200 and r.json().get("valid"):
-        print("✅ Password already set")
+        print("✅ Logged in with SONAR_PASSWORD")
+
+        # 🔥 UPDATE ONLY IF NEW PASSWORD PROVIDED
+        if new_password and new_password != current_password:
+            print("🔄 Updating password → SONAR_NEW_PASSWORD")
+
+            r = safe_request(
+                "POST",
+                f"{sonar_url}/api/users/change_password",
+                auth=(user, current_password),
+                data={
+                    "login": user,
+                    "previousPassword": current_password,
+                    "password": new_password
+                }
+            )
+
+            if r.status_code in [200, 204]:
+                print("✅ Password updated successfully")
+
+                # ✅ Update env file
+                update_env("SONAR_PASSWORD", new_password)
+
+                # 🔥 CRITICAL FIX → update runtime config
+                config["SONAR_PASSWORD"] = new_password
+
+                return
+            else:
+                raise Exception(f"❌ Update failed: {r.text}")
+
+        print("✅ No password change required")
         return
 
+    # -----------------------------
+    # 2️⃣ TRY NEW PASSWORD
+    # -----------------------------
+    if new_password:
+        r = safe_request(
+            "GET",
+            f"{sonar_url}/api/authentication/validate",
+            auth=(user, new_password)
+        )
+
+        if r.status_code == 200 and r.json().get("valid"):
+            print("✅ Logged in with SONAR_NEW_PASSWORD")
+
+            # Sync env + runtime
+            update_env("SONAR_PASSWORD", new_password)
+            config["SONAR_PASSWORD"] = new_password
+
+            return
+
+    # -----------------------------
+    # 3️⃣ TRY DEFAULT (FIRST RUN)
+    # -----------------------------
+    print("ℹ️ Trying default credentials...")
+
     r = safe_request(
-        "POST",
-        f"{BASE_URL}/api/users/change_password",
-        auth=(config["SONAR_USER"], config["SONAR_PASSWORD"]),
-        data={
-            "login": config["SONAR_USER"],
-            "previousPassword": config["SONAR_PASSWORD"],
-            "password": config["SONAR_NEW_PASSWORD"]
-        }
+        "GET",
+        f"{sonar_url}/api/authentication/validate",
+        auth=(user, "admin")
     )
 
-    if r.status_code in [200, 204]:
-        print("✅ Password updated")
-    else:
-        raise Exception("❌ Password update failed")
+    if r.status_code == 200 and r.json().get("valid"):
+
+        target = new_password if new_password else current_password
+
+        print("🔄 First-time setup → setting password")
+
+        r = safe_request(
+            "POST",
+            f"{sonar_url}/api/users/change_password",
+            auth=(user, "admin"),
+            data={
+                "login": user,
+                "previousPassword": "admin",
+                "password": target
+            }
+        )
+
+        if r.status_code in [200, 204]:
+            print("✅ Password initialized successfully")
+
+            # Sync env + runtime
+            update_env("SONAR_PASSWORD", target)
+            config["SONAR_PASSWORD"] = target
+
+            return
+
+    # -----------------------------
+    # 4️⃣ FAIL
+    # -----------------------------
+    raise Exception("❌ Unknown password state")
 
 
 # -----------------------------
@@ -169,10 +253,20 @@ def ensure_project(project_key):
         params={"projects": project_key}
     )
 
-    if r.json().get("components"):
+    # SAFE JSON HANDLING
+    if r.status_code != 200:
+        raise Exception(f"❌ API failed: {r.status_code} {r.text}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise Exception(f"❌ Invalid JSON response: {r.text}")
+
+    if data.get("components"):
         print(f"✅ {project_key} exists")
         return
 
+    # CREATE PROJECT
     safe_request(
         "POST",
         f"{BASE_URL}/api/projects/create",
@@ -184,7 +278,6 @@ def ensure_project(project_key):
     )
 
     print(f"✅ {project_key} created")
-
 
 # -----------------------------
 # QUALITY GATE

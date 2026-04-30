@@ -24,6 +24,7 @@ def get_env():
         # Jenkins
         "JENKINS_USER": os.getenv("JENKINS_USER"),
         "JENKINS_PASSWORD": os.getenv("JENKINS_PASSWORD"),
+        "JENKINS_NEW_PASSWORD": os.getenv("JENKINS_NEW_PASSWORD"),
         "JENKINS_TOKEN": os.getenv("JENKINS_TOKEN"),
 
         # Sonar
@@ -35,6 +36,8 @@ def get_env():
         # Nexus
         "NEXUS_USER": os.getenv("NEXUS_USER"),
         "NEXUS_PASSWORD": os.getenv("NEXUS_PASSWORD"),
+        "NEXUS_NEW_PASSWORD": os.getenv("NEXUS_NEW_PASSWORD"),
+
 
         # GitHub
         "GITHUB_USER": os.getenv("GITHUB_USER"),
@@ -46,6 +49,7 @@ def get_env():
 
         # ArgoCD
         "ARGOCD_USER": os.getenv("ARGOCD_USER"),
+        "ARGOCD_PASSWORD": os.getenv("ARGOCD_PASSWORD"),
         "ARGOCD_NEW_PASSWORD": os.getenv("ARGOCD_NEW_PASSWORD"),
     }
 

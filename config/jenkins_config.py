@@ -10,6 +10,43 @@ BASE_URL = config["JENKINS_URL"]
 CONTAINER_NAME = "jenkins"
 ENV_FILE = "env.txt"
 
+# -----------------------------
+# UPDATE ENV FILE
+# -----------------------------
+def write_env(key, value, file_path="env.txt"):
+    lines = []
+    found = False
+
+    with open(file_path, "r") as f:
+        for line in f:
+            if line.startswith(f"{key}="):
+                lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                lines.append(line)
+
+    if not found:
+        lines.append(f"{key}={value}\n")
+
+    with open(file_path, "w") as f:
+        f.writelines(lines)
+
+    print(f"✅ {key} updated in env.txt")
+
+
+def safe_add_crumb(session):
+    try:
+        r = session.get(f"{BASE_URL}/crumbIssuer/api/json")
+
+        if r.status_code == 200:
+            data = r.json()
+            session.headers.update({
+                data["crumbRequestField"]: data["crumb"]
+            })
+        else:
+            print("ℹ️ Crumb not required")
+    except:
+        print("ℹ️ Crumb skipped")
 
 # -----------------------------
 # DOCKER CLIENT 
@@ -115,28 +152,84 @@ def ensure_password():
     print("\n🔐 Ensuring Jenkins password...\n")
 
     user = config["JENKINS_USER"]
-    new_pwd = config["JENKINS_PASSWORD"]
+    current_pwd = config.get("JENKINS_PASSWORD")
+    new_pwd = config.get("JENKINS_NEW_PASSWORD")
 
-    if can_login(user, new_pwd):
-        print("✅ Password already set")
+    # -----------------------------
+    # 1️⃣ TRY CURRENT PASSWORD
+    # -----------------------------
+    if can_login(user, current_pwd):
+        print("✅ Logged in with JENKINS_PASSWORD")
+
+        # Update only if new password provided
+        if new_pwd and new_pwd != current_pwd:
+            print("🔄 Updating password → JENKINS_NEW_PASSWORD")
+
+            session = requests.Session()
+            session.auth = (user, current_pwd)
+
+            safe_add_crumb(session)
+
+            script = f"""
+import jenkins.model.*
+import hudson.security.*
+
+def instance = Jenkins.instance
+def realm = instance.getSecurityRealm()
+
+realm.createAccount("{user}", "{new_pwd}")
+
+instance.save()
+"""
+
+            r = session.post(f"{BASE_URL}/scriptText", data={"script": script})
+
+            if r.status_code not in [200, 201]:
+                raise Exception(f"❌ Password update failed: {r.text}")
+
+            print("✅ Password updated successfully")
+
+            # 🔥 persist + runtime sync
+            write_env("JENKINS_PASSWORD", new_pwd)
+            config["JENKINS_PASSWORD"] = new_pwd
+
+            return
+
+        print("✅ No password change required")
         return
 
+    # -----------------------------
+    # 2️⃣ TRY NEW PASSWORD
+    # -----------------------------
+    if new_pwd and can_login(user, new_pwd):
+        print("✅ Logged in with JENKINS_NEW_PASSWORD")
+
+        # 🔥 promote new → current
+        write_env("JENKINS_PASSWORD", new_pwd)
+        config["JENKINS_PASSWORD"] = new_pwd
+
+        return
+
+    # -----------------------------
+    # 3️⃣ FIRST RUN (INITIAL PASSWORD)
+    # -----------------------------
     initial_pwd = get_initial_password()
 
-    session = requests.Session()
-    session.auth = (user, initial_pwd)
+    if initial_pwd:
+        print("🔄 First-time setup → setting password")
 
-    crumb = session.get(f"{BASE_URL}/crumbIssuer/api/json").json()
-    session.headers.update({crumb["crumbRequestField"]: crumb["crumb"]})
+        session = requests.Session()
+        session.auth = (user, initial_pwd)
 
-    script = f"""
+        # ⚠️ no crumb needed for first setup
+        script = f"""
 import jenkins.model.*
 import hudson.security.*
 
 def instance = Jenkins.instance
 
 def realm = new HudsonPrivateSecurityRealm(false)
-realm.createAccount("{user}", "{new_pwd}")
+realm.createAccount("{user}", "{current_pwd}")
 
 instance.setSecurityRealm(realm)
 
@@ -146,12 +239,27 @@ instance.setAuthorizationStrategy(strategy)
 instance.save()
 """
 
-    session.post(f"{BASE_URL}/scriptText", data={"script": script})
+        r = session.post(f"{BASE_URL}/scriptText", data={"script": script})
 
-    print("✅ Password set")
+        if r.status_code not in [200, 201]:
+            raise Exception(f"❌ Initial setup failed: {r.text}")
 
-    client.containers.get(CONTAINER_NAME).restart()
-    wait_for_jenkins()
+        print("✅ Password initialized successfully")
+
+        # 🔥 persist + runtime sync
+        write_env("JENKINS_PASSWORD", current_pwd)
+        config["JENKINS_PASSWORD"] = current_pwd
+
+        # restart required once
+        client.containers.get(CONTAINER_NAME).restart()
+        wait_for_jenkins()
+
+        return
+
+    # -----------------------------
+    # 4️⃣ FAIL
+    # -----------------------------
+    raise Exception("❌ Unable to determine Jenkins password state")
 
 
 # -----------------------------
@@ -320,13 +428,35 @@ def add_credentials():
     headers = {crumb["crumbRequestField"]: crumb["crumb"]}
 
     create_url = f"{BASE_URL}/credentials/store/system/domain/_/createCredentials"
+    update_url = f"{BASE_URL}/credentials/store/system/domain/_/credential/{{cid}}/config.xml"
 
     # -----------------------------
-    # CREATE FUNCTION
+    # CREATE OR UPDATE FUNCTION
     # -----------------------------
     def ensure_credential(cid, user, pwd):
+
         if cid in existing_ids:
-            print(f"✅ {cid} already exists")
+            print(f"🔄 Updating {cid}...")
+
+            xml = f"""
+<com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>
+  <scope>GLOBAL</scope>
+  <id>{cid}</id>
+  <description>{cid}</description>
+  <username>{user}</username>
+  <password>{pwd}</password>
+</com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>
+"""
+
+            safe_request(
+                "POST",
+                update_url.format(cid=cid),
+                auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+                headers={**headers, "Content-Type": "application/xml"},
+                data=xml
+            )
+
+            print(f"✅ {cid} updated")
             return
 
         print(f"➕ Creating {cid}...")
@@ -354,7 +484,7 @@ def add_credentials():
         print(f"✅ {cid} created")
 
     # -----------------------------
-    # ENSURE ALL CREDENTIALS
+    # APPLY
     # -----------------------------
     ensure_credential("github-cred", config["GITHUB_USER"], config["GITHUB_TOKEN"])
     ensure_credential("dockerhub-cred", config["DOCKER_USER"], config["DOCKER_PASS"])
@@ -362,11 +492,22 @@ def add_credentials():
 
     print("\n✅ Credentials setup completed\n")
 
+
 # -----------------------------
 # SONAR TOKEN CREDENTIAL
 # -----------------------------
 def ensure_sonar_token_credential():
-    url = f"{BASE_URL}/credentials/store/system/domain/_/createCredentials"
+    print("🔐 Ensuring sonar-token credential...")
+
+    creds_url = f"{BASE_URL}/credentials/store/system/domain/_/api/json?tree=credentials[id]"
+
+    res = safe_request(
+        "GET",
+        creds_url,
+        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    ).json()
+
+    existing_ids = [c["id"] for c in res.get("credentials", [])]
 
     crumb = safe_request(
         "GET",
@@ -376,24 +517,51 @@ def ensure_sonar_token_credential():
 
     headers = {crumb["crumbRequestField"]: crumb["crumb"]}
 
+    if "sonar-token" in existing_ids:
+        print("🔄 Updating sonar-token...")
+
+        xml = f"""
+<org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>
+  <scope>GLOBAL</scope>
+  <id>sonar-token</id>
+  <description>sonar-token</description>
+  <secret>{config["SONAR_TOKEN"]}</secret>
+</org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>
+"""
+
+        safe_request(
+            "POST",
+            f"{BASE_URL}/credentials/store/system/domain/_/credential/sonar-token/config.xml",
+            auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
+            headers={**headers, "Content-Type": "application/xml"},
+            data=xml
+        )
+
+        print("✅ sonar-token updated")
+        return
+
+    print("➕ Creating sonar-token...")
+
     payload = {
         "": "0",
         "credentials": {
             "scope": "GLOBAL",
             "id": "sonar-token",
             "secret": config["SONAR_TOKEN"],
+            "description": "sonar-token",
             "$class": "org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl"
         }
     }
 
     safe_request(
         "POST",
-        url,
+        f"{BASE_URL}/credentials/store/system/domain/_/createCredentials",
         auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
         headers=headers,
         data={"json": json.dumps(payload)}
     )
 
+    print("✅ sonar-token created")
 
 # -----------------------------
 # CONFIGURE TOOLS 
@@ -420,7 +588,7 @@ def mavenExists = mavenList.find { it.name == "maven-3" }
 
 if (mavenExists != null) {
     println("✅ Maven already configured")
-} else {
+} else { 
     println("🔄 Configuring Maven...")
 
     def installer = new MavenInstaller("3.9.9")

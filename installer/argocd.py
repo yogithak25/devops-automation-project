@@ -66,7 +66,7 @@ def argocd_installed():
 # -----------------------------
 # INSTALL ARGOCD
 # -----------------------------
-def install_argocd():
+def install_argocd_manifest():
     print("\n🚀 Installing ArgoCD...\n")
 
     container = client.containers.get(K3S_CONTAINER)
@@ -157,7 +157,7 @@ def install_argocd():
         print("✅ Namespace exists")
 
     if not argocd_installed():
-        install_argocd()
+        install_argocd_manifest()
     else:
         print("✅ ArgoCD already installed")
     patch_service()
