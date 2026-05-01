@@ -673,7 +673,7 @@ if (sonarExists != null) {
 } else {
     println("🔄 Configuring Sonar Scanner...")
 
-    def installer = new SonarRunnerInstaller("latest")
+    def installer = new SonarRunnerInstaller("8.1.0.6389")
     def prop = new InstallSourceProperty([installer])
     def sonar = new SonarRunnerInstallation("sonar-scanner", "", [prop])
 
