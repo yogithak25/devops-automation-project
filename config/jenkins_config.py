@@ -49,7 +49,7 @@ def safe_add_crumb(session):
         raise Exception(f"❌ Failed to get Jenkins crumb: {e}")
 
 # -----------------------------
-# DOCKER CLIENT 
+# DOCKER CLIENT
 # -----------------------------
 def get_client():
     try:
@@ -301,7 +301,6 @@ def generate_token():
 # INSTALL PLUGINS
 # -----------------------------
 def install_plugins():
-
     print("\n📦 Installing plugins...\n")
 
     plugins = [
@@ -317,79 +316,98 @@ def install_plugins():
         "pipeline-maven"
     ]
 
-    # -----------------------------
-    # WAIT FOR PLUGIN API READY
-    # -----------------------------
-    print("⏳ Waiting for Plugin Manager API...\n")
+    env = get_env()
+    user = env["JENKINS_USER"]
+    password = env["JENKINS_PASSWORD"]
 
-    for i in range(30):
+    session = requests.Session()
+    session.auth = (user, password)
+
+    # -----------------------------
+    # STEP 1: TRY FETCH INSTALLED
+    # -----------------------------
+    print("⏳ Checking installed plugins...")
+
+    installed = None
+
+    for i in range(20):
         try:
-            r = requests.get(
+            r = session.get(
                 f"{BASE_URL}/pluginManager/api/json?depth=1",
-                auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
                 timeout=5
             )
 
-            if r.status_code == 200 and r.text.strip().startswith("{"):
+            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
                 data = r.json()
+                installed = [p["shortName"] for p in data.get("plugins", [])]
                 break
-
         except:
             pass
 
-        print(f"Waiting plugin API... {i+1}/30")
-        time.sleep(5)
+        time.sleep(3)
+
+    # -----------------------------
+    # STEP 2: HANDLE FIRST RUN
+    # -----------------------------
+    if installed is None:
+        print("⚠️ Plugin API not ready → assuming fresh setup")
+        missing = plugins
     else:
-        raise Exception("❌ Plugin API not ready")
+        print(f"✅ Installed plugins: {len(installed)}")
+        missing = [p for p in plugins if p not in installed]
 
-    # -----------------------------
-    # GET INSTALLED PLUGINS
-    # -----------------------------
-    installed = [p["shortName"] for p in data.get("plugins", [])]
-
-    # -----------------------------
-    # FILTER MISSING
-    # -----------------------------
-    to_install = [
-        f'<install plugin="{p}@latest"/>' for p in plugins if p not in installed
-    ]
-
-    if not to_install:
-        print("✅ All plugins already installed")
+    if not missing:
+        print("✅ All plugins already installed. Skipping.")
         return
 
-    print(f"⬇️ Installing {len(to_install)} plugins...")
-
-    xml = f"<jenkins>{''.join(to_install)}</jenkins>"
+    print(f"⬇️ Installing plugins: {missing}")
 
     # -----------------------------
-    # GET CRUMB
+    # STEP 3: GET CRUMB
     # -----------------------------
-    crumb = safe_request(
-        "GET",
-        f"{BASE_URL}/crumbIssuer/api/json",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
-    ).json()
+    crumb = None
 
-    headers = {
-        "Content-Type": "text/xml",
+    for i in range(20):
+        try:
+            r = session.get(f"{BASE_URL}/crumbIssuer/api/json", timeout=5)
+
+            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
+                crumb = r.json()
+                break
+        except:
+            pass
+
+        time.sleep(2)
+
+    if not crumb:
+        raise Exception("❌ Failed to get crumb")
+
+    session.headers.update({
         crumb["crumbRequestField"]: crumb["crumb"]
-    }
+    })
 
     # -----------------------------
-    # INSTALL PLUGINS
+    # STEP 4: INSTALL
     # -----------------------------
-    safe_request(
-        "POST",
+    xml = "<jenkins>" + "".join(
+        [f'<install plugin="{p}@latest"/>' for p in missing]
+    ) + "</jenkins>"
+
+    r = session.post(
         f"{BASE_URL}/pluginManager/installNecessaryPlugins",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
-        headers=headers,
+        headers={"Content-Type": "text/xml"},
         data=xml
     )
 
-    print("⏳ Installing plugins (90s)...")
+    if r.status_code not in [200, 201, 202]:
+        raise Exception(f"❌ Plugin install failed: {r.text}")
+
+    print("⏳ Installing plugins...")
     time.sleep(90)
 
+    # -----------------------------
+    # STEP 5: RESTART
+    # -----------------------------
     print("🔄 Restarting Jenkins...")
 
     client.containers.get(CONTAINER_NAME).restart()
@@ -397,43 +415,65 @@ def install_plugins():
 
     print("✅ Plugins installed successfully")
 
+
 # -----------------------------
 # ADD CREDENTIALS
 # -----------------------------
 def add_credentials():
     print("\n🔐 Ensuring Jenkins credentials...\n")
 
+    user = config["JENKINS_USER"]
+    password = config["JENKINS_PASSWORD"]
+
     # -----------------------------
-    # GET EXISTING CREDENTIALS
+    # USE SESSION
     # -----------------------------
+    session = requests.Session()
+    session.auth = (user, password)
+
     creds_url = f"{BASE_URL}/credentials/store/system/domain/_/api/json?tree=credentials[id]"
 
-    res = safe_request(
-        "GET",
-        creds_url,
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
-    ).json()
+    # -----------------------------
+    # WAIT FOR API READY
+    # -----------------------------
+    print("⏳ Waiting for credentials API...\n")
 
-    existing_ids = [c["id"] for c in res.get("credentials", [])]
+    res_json = None
+
+    for i in range(30):
+        try:
+            r = session.get(creds_url, timeout=5)
+
+            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
+                res_json = r.json()
+                print("✅ Credentials API ready")
+                break
+            else:
+                print(f"Waiting... {i+1}/30")
+
+        except:
+            pass
+
+        time.sleep(5)
+
+    if not res_json:
+        raise Exception("❌ Credentials API not ready")
+
+    existing_ids = [c["id"] for c in res_json.get("credentials", [])]
 
     # -----------------------------
-    # GET CRUMB
+    # GET CRUMB (same session)
     # -----------------------------
-    crumb = safe_request(
-        "GET",
-        f"{BASE_URL}/crumbIssuer/api/json",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
-    ).json()
+    crumb = session.get(f"{BASE_URL}/crumbIssuer/api/json").json()
 
-    headers = {crumb["crumbRequestField"]: crumb["crumb"]}
+    session.headers.update({
+        crumb["crumbRequestField"]: crumb["crumb"]
+    })
 
     create_url = f"{BASE_URL}/credentials/store/system/domain/_/createCredentials"
     update_url = f"{BASE_URL}/credentials/store/system/domain/_/credential/{{cid}}/config.xml"
 
-    # -----------------------------
-    # CREATE OR UPDATE FUNCTION
-    # -----------------------------
-    def ensure_credential(cid, user, pwd):
+    def ensure_credential(cid, user_val, pwd_val):
 
         if cid in existing_ids:
             print(f"🔄 Updating {cid}...")
@@ -443,16 +483,14 @@ def add_credentials():
   <scope>GLOBAL</scope>
   <id>{cid}</id>
   <description>{cid}</description>
-  <username>{user}</username>
-  <password>{pwd}</password>
+  <username>{user_val}</username>
+  <password>{pwd_val}</password>
 </com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>
 """
 
-            safe_request(
-                "POST",
+            session.post(
                 update_url.format(cid=cid),
-                auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
-                headers={**headers, "Content-Type": "application/xml"},
+                headers={"Content-Type": "application/xml"},
                 data=xml
             )
 
@@ -466,32 +504,26 @@ def add_credentials():
             "credentials": {
                 "scope": "GLOBAL",
                 "id": cid,
-                "username": user,
-                "password": pwd,
+                "username": user_val,
+                "password": pwd_val,
                 "description": cid,
                 "$class": "com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl"
             }
         }
 
-        safe_request(
-            "POST",
+        session.post(
             create_url,
-            auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
-            headers=headers,
             data={"json": json.dumps(payload)}
         )
 
         print(f"✅ {cid} created")
 
-    # -----------------------------
     # APPLY
-    # -----------------------------
     ensure_credential("github-cred", config["GITHUB_USER"], config["GITHUB_TOKEN"])
     ensure_credential("dockerhub-cred", config["DOCKER_USER"], config["DOCKER_PASS"])
     ensure_credential("nexus-cred", config["NEXUS_USER"], config["NEXUS_PASSWORD"])
 
     print("\n✅ Credentials setup completed\n")
-
 
 # -----------------------------
 # SONAR TOKEN CREDENTIAL
@@ -499,24 +531,54 @@ def add_credentials():
 def ensure_sonar_token_credential():
     print("🔐 Ensuring sonar-token credential...")
 
+    user = config["JENKINS_USER"]
+    password = config["JENKINS_PASSWORD"]
+
+    session = requests.Session()
+    session.auth = (user, password)
+
     creds_url = f"{BASE_URL}/credentials/store/system/domain/_/api/json?tree=credentials[id]"
 
-    res = safe_request(
-        "GET",
-        creds_url,
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
-    ).json()
+    # -----------------------------
+    # WAIT FOR API READY
+    # -----------------------------
+    print("⏳ Waiting for credentials API (sonar)...")
 
-    existing_ids = [c["id"] for c in res.get("credentials", [])]
+    res_json = None
 
-    crumb = safe_request(
-        "GET",
-        f"{BASE_URL}/crumbIssuer/api/json",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
-    ).json()
+    for i in range(30):
+        try:
+            r = session.get(creds_url, timeout=5)
 
-    headers = {crumb["crumbRequestField"]: crumb["crumb"]}
+            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
+                res_json = r.json()
+                print("✅ Credentials API ready")
+                break
+            else:
+                print(f"Waiting... {i+1}/30")
 
+        except:
+            pass
+
+        time.sleep(5)
+
+    if not res_json:
+        raise Exception("❌ Credentials API not ready")
+
+    existing_ids = [c["id"] for c in res_json.get("credentials", [])]
+
+    # -----------------------------
+    # GET CRUMB (same session)
+    # -----------------------------
+    crumb = session.get(f"{BASE_URL}/crumbIssuer/api/json").json()
+
+    session.headers.update({
+        crumb["crumbRequestField"]: crumb["crumb"]
+    })
+
+    # -----------------------------
+    # CREATE OR UPDATE
+    # -----------------------------
     if "sonar-token" in existing_ids:
         print("🔄 Updating sonar-token...")
 
@@ -529,11 +591,9 @@ def ensure_sonar_token_credential():
 </org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>
 """
 
-        safe_request(
-            "POST",
+        session.post(
             f"{BASE_URL}/credentials/store/system/domain/_/credential/sonar-token/config.xml",
-            auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
-            headers={**headers, "Content-Type": "application/xml"},
+            headers={"Content-Type": "application/xml"},
             data=xml
         )
 
@@ -553,18 +613,16 @@ def ensure_sonar_token_credential():
         }
     }
 
-    safe_request(
-        "POST",
+    session.post(
         f"{BASE_URL}/credentials/store/system/domain/_/createCredentials",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
-        headers=headers,
         data={"json": json.dumps(payload)}
     )
 
     print("✅ sonar-token created")
 
+
 # -----------------------------
-# CONFIGURE TOOLS 
+# CONFIGURE TOOLS
 # -----------------------------
 def configure_tools():
     print("\n⚙️ Ensuring Maven + Sonar tools...\n")
@@ -588,7 +646,7 @@ def mavenExists = mavenList.find { it.name == "maven-3" }
 
 if (mavenExists != null) {
     println("✅ Maven already configured")
-} else { 
+} else {
     println("🔄 Configuring Maven...")
 
     def installer = new MavenInstaller("3.9.9")
@@ -629,7 +687,6 @@ if (sonarExists != null) {
 println("⚙️ Tool configuration ensured")
 """
     print(run_groovy(script))
-
 
 
 # -----------------------------
@@ -737,24 +794,65 @@ def configure_nexus_settings():
 # RUN GROOVY
 # -----------------------------
 def run_groovy(script):
-    crumb = safe_request(
-        "GET",
-        f"{BASE_URL}/crumbIssuer/api/json",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"])
-    ).json()
+    user = config["JENKINS_USER"]
+    password = config["JENKINS_PASSWORD"]   # 🔥 USE PASSWORD
 
-    headers = {crumb["crumbRequestField"]: crumb["crumb"]}
+    session = requests.Session()
+    session.auth = (user, password)
 
-    r = safe_request(
-        "POST",
+    # -----------------------------
+    # WAIT FOR JENKINS READY
+    # -----------------------------
+    print("⏳ Waiting for Groovy API readiness...")
+
+    for i in range(20):
+        try:
+            r = session.get(f"{BASE_URL}/api/json", timeout=5)
+
+            if r.status_code == 200:
+                break
+        except:
+            pass
+
+        print(f"Waiting... {i+1}/20")
+        time.sleep(3)
+
+    # -----------------------------
+    # GET CRUMB (same session)
+    # -----------------------------
+    crumb = None
+
+    for i in range(20):
+        try:
+            r = session.get(f"{BASE_URL}/crumbIssuer/api/json", timeout=5)
+
+            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
+                crumb = r.json()
+                break
+        except:
+            pass
+
+        time.sleep(2)
+
+    if not crumb:
+        raise Exception("❌ Failed to get crumb")
+
+    session.headers.update({
+        crumb["crumbRequestField"]: crumb["crumb"]
+    })
+
+    # -----------------------------
+    # EXECUTE GROOVY
+    # -----------------------------
+    r = session.post(
         f"{BASE_URL}/scriptText",
-        auth=(config["JENKINS_USER"], config["JENKINS_TOKEN"]),
-        headers=headers,
         data={"script": script}
     )
 
-    return r.text
+    if r.status_code not in [200, 201]:
+        raise Exception(f"❌ Groovy execution failed: {r.text}")
 
+    return r.text
 
 # -----------------------------
 # MAIN
@@ -765,6 +863,9 @@ def setup_jenkins():
     wait_for_jenkins()
     ensure_password()
     generate_token()
+
+    client.containers.get(CONTAINER_NAME).restart()
+    wait_for_jenkins()
 
     install_plugins()
 
