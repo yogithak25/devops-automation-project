@@ -1,11 +1,9 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv("env.txt")
-
-
 def get_env():
-
+    
+    load_dotenv("env.txt", override=True)
     ip = os.getenv("EC2_IP")
 
     if not ip:
