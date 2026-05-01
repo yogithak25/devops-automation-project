@@ -23,7 +23,7 @@ def safe_request(session, method, url, **kwargs):
 # -----------------------------
 def get_session():
     session = requests.Session()
-    session.auth = (config["JENKINS_USER"], config["JENKINS_TOKEN"])
+    session.auth = (config["JENKINS_USER"], config["JENKINS_PASSWORD"])
 
     r = session.get(f"{config['JENKINS_URL']}/crumbIssuer/api/json")
 
