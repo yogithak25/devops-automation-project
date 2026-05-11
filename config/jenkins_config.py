@@ -403,7 +403,7 @@ def install_plugins():
         raise Exception(f"❌ Plugin install failed: {r.text}")
 
     print("⏳ Installing plugins...")
-    time.sleep(200)
+    time.sleep(240)
 
     # -----------------------------
     # STEP 5: RESTART
